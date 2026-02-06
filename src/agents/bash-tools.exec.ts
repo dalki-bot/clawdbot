@@ -78,6 +78,54 @@ const DANGEROUS_HOST_ENV_VARS = new Set([
 ]);
 const DANGEROUS_HOST_ENV_PREFIXES = ["DYLD_", "LD_"];
 
+/**
+ * Detect bare `claude` CLI invocations missing the `-p` (print/pipe) flag.
+ * Without `-p` the CLI enters interactive mode and hangs because there is no
+ * TTY input — a frequent mistake when agents shell out to Claude Code.
+ * Returns the rewritten command with `-p` injected, or `null` if no fix needed.
+ */
+export function fixClaudeCliInteractiveHang(command: string): {
+  fixed: string;
+  warning: string;
+} | null {
+  // Match `claude` as the first token (possibly after env assignments or path prefix).
+  // We only care about simple invocations — piped commands with claude as a
+  // downstream segment are unlikely to hang the same way.
+  const trimmed = command.trim();
+
+  // Extract the first pipeline segment (before any |, &&, ;).
+  const firstSegment = trimmed.split(/[|;&]/, 1)[0].trim();
+
+  // Check if the command starts with `claude` (with optional path prefix).
+  const claudePattern = /(?:^|\/)claude(?:\s|$)/;
+  if (!claudePattern.test(firstSegment)) {
+    return null;
+  }
+
+  // Already has -p or --print flag — nothing to fix.
+  if (/(?:^|\s)-p(?:\s|$)/.test(firstSegment) || /--print(?:\s|$)/.test(firstSegment)) {
+    return null;
+  }
+
+  // Already piping into claude or using --resume (session continuation is fine).
+  if (/--resume\b/.test(firstSegment)) {
+    return null;
+  }
+
+  // Inject -p right after the `claude` binary token.
+  const fixed = trimmed.replace(claudePattern, (match) => {
+    // Keep trailing whitespace/end-of-string as-is.
+    return match.replace("claude", "claude -p");
+  });
+
+  return {
+    fixed,
+    warning:
+      "Auto-injected `-p` flag: `claude` without `-p` runs in interactive mode and will hang. " +
+      'Use `claude -p "<prompt>"` for non-interactive execution.',
+  };
+}
+
 // Centralized sanitization helper.
 // Throws an error if dangerous variables or PATH modifications are detected on the host.
 function validateHostEnv(env: Record<string, string>): void {
@@ -849,9 +897,19 @@ export function createExecTool(
         throw new Error("Provide a command to start.");
       }
 
+      // Guard: auto-fix bare `claude` calls missing `-p` (would hang in interactive mode).
+      const claudeFix = fixClaudeCliInteractiveHang(params.command);
+      if (claudeFix) {
+        logWarn(`exec: ${claudeFix.warning} (original: ${truncateMiddle(params.command, 120)})`);
+        params.command = claudeFix.fixed;
+      }
+
       const maxOutput = DEFAULT_MAX_OUTPUT;
       const pendingMaxOutput = DEFAULT_PENDING_MAX_OUTPUT;
       const warnings: string[] = [];
+      if (claudeFix) {
+        warnings.push(claudeFix.warning);
+      }
       const backgroundRequested = params.background === true;
       const yieldRequested = typeof params.yieldMs === "number";
       if (!allowBackground && (backgroundRequested || yieldRequested)) {
